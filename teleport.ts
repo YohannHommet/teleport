@@ -5,7 +5,6 @@ import { createSocket } from "dgram";
 import { createServer, connect } from "net";
 import { networkInterfaces } from "os";
 import { basename, join, normalize, resolve } from "path";
-import { Transform } from "stream";
 
 // ===== CONFIGURATION =====
 const CONFIG = {
@@ -156,6 +155,7 @@ class SecurityUtils {
   }
 
   static canonicalBeaconString(beacon: BeaconData): string {
+    // Signature covers stable fields only (exclude transient/optional flags)
     return `${beacon.v}|${beacon.id}|${beacon.name}|${beacon.size}|${beacon.port}|${beacon.ip}|${beacon.timestamp}|${beacon.hash}`;
   }
 
@@ -277,14 +277,24 @@ class CryptoUtils {
    * Create cipher stream for encryption
    */
   static createCipherStream(key: Buffer, iv: Buffer): any {
-    return createCipheriv(CONFIG.ENCRYPTION.ALGORITHM, key, iv);
+    return createCipheriv(
+      CONFIG.ENCRYPTION.ALGORITHM,
+      key,
+      iv,
+      { authTagLength: CONFIG.ENCRYPTION.AUTH_TAG_LENGTH }
+    );
   }
 
   /**
    * Create decipher stream for decryption
    */
   static createDecipherStream(key: Buffer, iv: Buffer, authTag: Buffer): any {
-    const decipher = createDecipheriv(CONFIG.ENCRYPTION.ALGORITHM, key, iv);
+    const decipher = createDecipheriv(
+      CONFIG.ENCRYPTION.ALGORITHM,
+      key,
+      iv,
+      { authTagLength: CONFIG.ENCRYPTION.AUTH_TAG_LENGTH }
+    );
     decipher.setAuthTag(authTag);
     return decipher;
   }
@@ -355,6 +365,9 @@ if (cmd === "send") {
   const shouldEncrypt = !!flags.psk && CONFIG.ENCRYPTION.AUTO_ENCRYPT_WITH_PSK && !flags["no-encrypt"];
   if (shouldEncrypt) {
     console.log("🔐 Encryption: AES-256-GCM enabled");
+  } else if (flags.psk) {
+    // Debug: PSK provided but encryption not enabled
+    console.log(`[DEBUG] Encryption disabled: AUTO_ENCRYPT=${CONFIG.ENCRYPTION.AUTO_ENCRYPT_WITH_PSK}, no-encrypt=${!!flags["no-encrypt"]}`);
   }
 
   const server = createServer();
@@ -401,14 +414,42 @@ if (cmd === "send") {
         const key = await CryptoUtils.deriveKey(flags.psk, salt);
         
         // Send encryption header
+        if (process.env.TELEPORT_DEBUG_GCM) {
+          console.log(`[GCM] sender iv: ${iv.toString('hex')} salt: ${salt.toString('hex')} size: ${size}`);
+        }
         const header = CryptoUtils.createEncryptionHeader(iv, salt);
         sock.write(header);
         
         // Create cipher and stream encrypted file
         const cipher = CryptoUtils.createCipherStream(key, iv);
         const fileStream = createReadStream(file);
-        
-        fileStream.pipe(cipher).pipe(sock);
+
+        // Pipe with backpressure handling; keep socket open to append GCM tag
+        cipher.pipe(sock, { end: false });
+        cipher.on('end', () => {
+          try {
+            const tag: Buffer = (cipher as any).getAuthTag();
+            if (process.env.TELEPORT_DEBUG_GCM) {
+              console.log(`[GCM] sender tag: ${tag.toString('hex')}`);
+            }
+            // Write tag and only then end the socket to ensure full flush
+            sock.write(tag, () => {
+              try { sock.end(); } catch {}
+            });
+          } catch (e) {
+            console.error('Failed to get/write auth tag:', (e as any)?.message || e);
+            try { sock.end(); } catch {}
+          }
+        });
+        cipher.on('error', (e: any) => {
+          console.error('Cipher error:', e?.message || e);
+          try { sock.destroy(); } catch {}
+        });
+        fileStream.on('error', (e: any) => {
+          console.error('File read error:', e?.message || e);
+          try { sock.destroy(); } catch {}
+        });
+        fileStream.pipe(cipher);
         
       } else {
         // Unencrypted transfer (backward compatible)
@@ -464,11 +505,15 @@ if (cmd === "send") {
         beaconData.sig = await SecurityUtils.hmacSHA256(flags.psk, canonical);
       }
 
-      timer = setInterval(() => {
+      timer = setInterval(async () => {
         beaconData.timestamp = Date.now();
         if (flags.psk) {
-          // In production, regenerate signature with new timestamp
-          // For now, we'll use the original signature
+          // Regenerate signature whenever timestamp changes
+          const canonical = SecurityUtils.canonicalBeaconString(beaconData);
+          beaconData.sig = await SecurityUtils.hmacSHA256(flags.psk, canonical);
+        } else {
+          // Ensure no stale signature remains
+          delete (beaconData as any).sig;
         }
         const beacon = JSON.stringify(beaconData);
         udp.send(beacon, CONFIG.MCAST_PORT, CONFIG.MCAST_ADDR);
@@ -517,6 +562,8 @@ if (cmd === "send") {
 
   const seen = new Set<string>();
   let activeDownloads = 0;
+  // Avoid spamming logs when PSK is wrong: remember which senders had bad signatures
+  const badSigSeen = new Set<string>();
 
   const sock = createSocket({ type: "udp4", reuseAddr: true });
   sock.on("error", (err) => {
@@ -577,18 +624,22 @@ if (cmd === "send") {
 
     // Check if file is encrypted but no PSK provided
     if (encrypted && !flags.psk) {
-      console.warn(`⚠️ File ${name} is encrypted but no PSK provided - skipping`);
+      console.error(`❌ File ${name} is encrypted but no PSK provided - cannot download`);
       return;
     }
 
     // Verify PSK signature if required
     if (flags.psk) {
       try {
-        const beaconData = { v, id, name, size, port, ip, timestamp: timestamp || 0, hash: hash || '' };
+        const beaconData = { v, id, name, size, port, ip, timestamp: timestamp || 0, hash: hash || '', encrypted: encrypted || false };
         const canonical = SecurityUtils.canonicalBeaconString(beaconData as BeaconData);
         const expected = await SecurityUtils.hmacSHA256(flags.psk, canonical);
         if (sig !== expected) {
-          console.debug(`Rejected ${name}: signature mismatch`);
+          const sigKey = id || `${ip}:${port}:${name}`;
+          if (!badSigSeen.has(sigKey)) {
+            console.warn(`Rejected ${name}: signature mismatch`);
+            badSigSeen.add(sigKey);
+          }
           return;
         }
       } catch { 
@@ -651,25 +702,68 @@ if (cmd === "send") {
       let headerBuffer = Buffer.alloc(0);
       let decipher: any = null;
       let processingHeader = false;
+      const TAG_LEN = CONFIG.ENCRYPTION.AUTH_TAG_LENGTH;
+      // We know expected ciphertext length equals plaintext size for GCM
+      let bytesToDecipherLeft = size;
+      let tagStash: Buffer = Buffer.alloc(0);
+
+      const handleEncrypted = (data: Buffer) => {
+        if (!decipher) return; // should not happen
+        let buf = data;
+        if (bytesToDecipherLeft > 0 && buf.length > 0) {
+          const take = Math.min(bytesToDecipherLeft, buf.length);
+          if (take > 0) {
+            const part = buf.subarray(0, take);
+            const ok = decipher.write(part);
+            if (!ok) {
+              // Apply backpressure: pause socket until decipher drains
+              try { client.pause(); } catch {}
+              decipher.once('drain', () => {
+                try { client.resume(); } catch {}
+              });
+            }
+            buf = buf.subarray(take);
+            bytesToDecipherLeft -= take;
+          }
+        }
+        if (buf.length > 0) {
+          // Remaining bytes belong to the auth tag
+          const needed = TAG_LEN - tagStash.length;
+          const add = Math.min(needed, buf.length);
+          if (add > 0) tagStash = Buffer.concat([tagStash, buf.subarray(0, add)]);
+          if (buf.length > add) {
+            console.error(`\n❌ Protocol error: extra data after expected ciphertext+tag`);
+            try { decipher.destroy(new Error('Extra data after ciphertext')); } catch {}
+          }
+        }
+      };
 
       const processData = (chunk: Buffer) => {
-        if (!headerReceived && !processingHeader) {
-          // Accumulate data until we have the full header
+        if (!headerReceived) {
+          // Always buffer until header resolved; avoid dropping data while async key derivation runs
           headerBuffer = Buffer.concat([headerBuffer, chunk]);
 
-          if (headerBuffer.length >= 48) {
+          if (!processingHeader && headerBuffer.length >= 48) {
             processingHeader = true;
             
             (async () => {
               try {
                 // Parse encryption header
                 const headerData = CryptoUtils.parseEncryptionHeader(headerBuffer.slice(0, 48));
+                if (process.env.TELEPORT_DEBUG_GCM) {
+                  console.log(`[GCM] receiver iv: ${headerData.iv.toString('hex')} salt: ${headerData.salt.toString('hex')} size: ${size}`);
+                }
                 
                 // Derive decryption key
                 const key = await CryptoUtils.deriveKey(flags.psk!, headerData.salt);
                 
                 // Create decipher stream (GCM mode)
-                decipher = createDecipheriv(CONFIG.ENCRYPTION.ALGORITHM, key, headerData.iv);
+                decipher = createDecipheriv(
+                  CONFIG.ENCRYPTION.ALGORITHM,
+                  key,
+                  headerData.iv,
+                  { authTagLength: CONFIG.ENCRYPTION.AUTH_TAG_LENGTH }
+                );
                 
                 // Track decrypted data for progress
                 decipher.on('data', (decrypted: Buffer) => {
@@ -694,9 +788,10 @@ if (cmd === "send") {
                 // Setup decipher event handlers
                 decipher.on('error', (err: any) => {
                   console.error(`\n❌ Decryption error: ${err?.message || err}`);
+                  console.error(`   Code: ${err?.code || 'UNKNOWN'}`);
                   console.error(`   This usually means wrong PSK or corrupted data`);
                   activeDownloads--;
-                  writeStream.end();
+                  writeStream.destroy();
                 });
 
                 decipher.on('end', () => {
@@ -729,9 +824,13 @@ if (cmd === "send") {
                 headerReceived = true;
                 processingHeader = false;
 
-                // Send remaining data (after header) to decipher
+                // Process ALL bytes received after the first 48 header bytes
                 if (headerBuffer.length > 48) {
-                  decipher.write(headerBuffer.slice(48));
+                  const remaining = headerBuffer.slice(48);
+                  headerBuffer = Buffer.alloc(0);
+                  handleEncrypted(remaining);
+                } else {
+                  headerBuffer = Buffer.alloc(0);
                 }
               } catch (err: any) {
                 console.error(`\n❌ Decryption header error: ${err?.message || err}`);
@@ -741,25 +840,43 @@ if (cmd === "send") {
               }
             })();
           }
-        } else if (headerReceived && decipher) {
-          // Write encrypted data to decipher
-          decipher.write(chunk);
+        } else {
+          // Header resolved, normal encrypted data processing
+          handleEncrypted(chunk);
         }
       };
 
       client.on("data", processData);
 
       client.on("end", () => {
-        // Wait a bit for async header processing if needed
-        const tryEnd = () => {
-          if (decipher) {
-            decipher.end(); // This will trigger auth tag verification in GCM
-          } else if (!headerReceived) {
-            // Header not processed yet, try again
-            setTimeout(tryEnd, 10);
+        if (decipher) {
+          try {
+            if (bytesToDecipherLeft !== 0) {
+              console.error(`\n❌ Truncated stream: missing ${bytesToDecipherLeft} ciphertext bytes`);
+              try { decipher.destroy(new Error('Truncated ciphertext')); } catch {}
+              activeDownloads--;
+              return;
+            }
+            if (tagStash.length !== TAG_LEN) {
+              console.error(`\n❌ Invalid or missing auth tag: got ${tagStash.length} bytes (expected ${TAG_LEN})`);
+              try { decipher.destroy(new Error('Missing auth tag')); } catch {}
+              activeDownloads--;
+              return;
+            }
+            if (process.env.TELEPORT_DEBUG_GCM) {
+              console.log(`[GCM] receiver tag: ${tagStash.toString('hex')}`);
+            }
+            decipher.setAuthTag(tagStash);
+            decipher.end(); // triggers GCM auth verification
+          } catch (err: any) {
+            console.error(`[ERROR] Failed to finalize decryption: ${err?.message}`);
+            activeDownloads--;
+            return;
           }
-        };
-        tryEnd();
+        } else if (!headerReceived) {
+          console.error(`[ERROR] Connection ended before header was fully received`);
+          activeDownloads--;
+        }
       });
 
     } else {
